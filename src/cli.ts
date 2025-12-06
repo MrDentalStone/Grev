@@ -86,7 +86,15 @@ program
 program
   .command('proxy')
   .description('Start the Grov proxy server (intercepts Claude API calls)')
-  .action(async () => {
+  .option('--role <role>', 'User role: blank, manager, or developer (default: blank)', 'blank')
+  .action(async (options: { role?: string }) => {
+    // Set role via environment variable (highest priority in config)
+    if (options.role && ['blank', 'manager', 'developer'].includes(options.role)) {
+      process.env.GROV_ROLE = options.role;
+      if (options.role !== 'blank') {
+        console.log(`✓ Role: ${options.role.toUpperCase()}`);
+      }
+    }
     const { startServer } = await import('./proxy/server.js');
     await startServer();
   });

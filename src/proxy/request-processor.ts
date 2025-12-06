@@ -6,16 +6,19 @@ import {
   getTasksByFiles,
   getStepsReasoningByPath,
   type Task,
+  type UserRole,
 } from '../lib/store.js';
 import { truncate } from '../lib/utils.js';
 
 /**
  * Build context from team memory for injection
  * Queries tasks and file_reasoning tables
+ * @param role - Optional role for role-specific formatting (manager/developer)
  */
 export function buildTeamMemoryContext(
   projectPath: string,
-  mentionedFiles: string[]
+  mentionedFiles: string[],
+  role?: UserRole
 ): string | null {
   // Get recent completed tasks for this project
   const tasks = getTasksForProject(projectPath, {
@@ -40,107 +43,92 @@ export function buildTeamMemoryContext(
     return null;
   }
 
-  return formatTeamMemoryContext(allTasks, fileReasonings, mentionedFiles);
+  return formatTeamMemoryContext(allTasks, fileReasonings, mentionedFiles, role);
 }
 
 /**
  * Format team memory context for injection
+ * Role-aware: Manager sees decisions/constraints, Developer sees files/reasoning
  */
 function formatTeamMemoryContext(
   tasks: Task[],
   fileReasonings: Array<{ file_path: string; anchor?: string; reasoning: string }>,
-  files: string[]
+  files: string[],
+  role?: UserRole
 ): string {
   const lines: string[] = [];
 
-  lines.push('=== VERIFIED TEAM KNOWLEDGE (from previous sessions) ===');
-  lines.push('');
-  lines.push('IMPORTANT: This context has been verified. USE IT to answer directly.');
-  lines.push('DO NOT launch Explore agents or re-investigate files mentioned below.');
+  lines.push('[GROV CONTEXT - Relevant past reasoning]');
   lines.push('');
 
-  // File-level context
+  // File-level context (more detailed for developer)
   if (fileReasonings.length > 0) {
     lines.push('File-level context:');
-    for (const fr of fileReasonings.slice(0, 5)) {
+    const limit = role === 'developer' ? 8 : 3;  // Developer gets more file details
+    for (const fr of fileReasonings.slice(0, limit)) {
       const anchor = fr.anchor ? ` (${fr.anchor})` : '';
-      lines.push(`- ${fr.file_path}${anchor}: ${truncate(fr.reasoning, 100)}`);
+      const reasoningLimit = role === 'developer' ? 150 : 80;
+      lines.push(`- ${fr.file_path}${anchor}: ${truncate(fr.reasoning, reasoningLimit)}`);
     }
     lines.push('');
   }
 
-  // Task context with decisions and constraints
+  // Task context - role-specific formatting
   if (tasks.length > 0) {
     lines.push('Related past tasks:');
     for (const task of tasks.slice(0, 5)) {
       lines.push(`- ${truncate(task.original_query, 60)}`);
-      if (task.files_touched.length > 0) {
-        const fileList = task.files_touched.slice(0, 3).map(f => f.split('/').pop()).join(', ');
-        lines.push(`  Files: ${fileList}`);
-      }
-      if (task.reasoning_trace.length > 0) {
-        lines.push(`  Key: ${truncate(task.reasoning_trace[0], 80)}`);
-      }
-      // Include decisions if available
-      if (task.decisions && task.decisions.length > 0) {
-        lines.push(`  Decision: ${task.decisions[0].choice} (${truncate(task.decisions[0].reason, 50)})`);
-      }
-      // Include constraints if available
-      if (task.constraints && task.constraints.length > 0) {
-        lines.push(`  Constraints: ${task.constraints.slice(0, 2).join(', ')}`);
+
+      if (role === 'manager') {
+        // Manager focus: decisions, constraints, high-level scope
+        if (task.decisions && task.decisions.length > 0) {
+          lines.push(`  Decision: ${task.decisions[0].choice}`);
+          if (task.decisions[0].reason) {
+            lines.push(`  Reason: ${truncate(task.decisions[0].reason, 80)}`);
+          }
+        }
+        if (task.constraints && task.constraints.length > 0) {
+          lines.push(`  Constraints: ${task.constraints.slice(0, 3).join(', ')}`);
+        }
+      } else {
+        // Developer focus: files, implementation details, reasoning
+        if (task.files_touched.length > 0) {
+          const fileList = task.files_touched.slice(0, 5).map(f => f.split('/').pop()).join(', ');
+          lines.push(`  Files: ${fileList}`);
+        }
+        if (task.reasoning_trace.length > 0) {
+          lines.push(`  Key: ${truncate(task.reasoning_trace[0], 100)}`);
+        }
+        // Developer also sees constraints as implementation guidelines
+        if (task.constraints && task.constraints.length > 0) {
+          lines.push(`  Must follow: ${task.constraints.slice(0, 2).join(', ')}`);
+        }
       }
     }
     lines.push('');
   }
 
   if (files.length > 0) {
-    lines.push(`Files with existing context: ${files.join(', ')}`);
+    lines.push(`You may already have context for: ${files.join(', ')}`);
   }
-  lines.push('');
-  lines.push('Answer the user\'s question using the knowledge above. Skip exploration.');
-  lines.push('=== END VERIFIED TEAM KNOWLEDGE ===');
+  lines.push('[END GROV CONTEXT]');
 
   return lines.join('\n');
 }
 
 /**
- * Extract file paths from messages (user messages only, clean text)
+ * Extract file paths from messages
  */
 export function extractFilesFromMessages(
   messages: Array<{ role: string; content: unknown }>
 ): string[] {
   const files: string[] = [];
-  // Pattern matches filenames with extensions, allowing common punctuation after
-  const filePattern = /(?:^|\s|["'`])([\/\w.-]+\.[a-zA-Z]{1,10})(?:["'`]|\s|$|[:)\]?!,;])/g;
+  const filePattern = /(?:^|\s|["'`])([\/\w.-]+\.[a-zA-Z]{1,10})(?:["'`]|\s|$|:|\))/g;
 
   for (const msg of messages) {
-    // Only scan user messages for file mentions
-    if (msg.role !== 'user') continue;
-
-    let textContent = '';
-
-    // Handle string content
     if (typeof msg.content === 'string') {
-      textContent = msg.content;
-    }
-
-    // Handle array content (Claude Code API format)
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block && typeof block === 'object' && 'type' in block && block.type === 'text' && 'text' in block && typeof block.text === 'string') {
-          textContent += block.text + '\n';
-        }
-      }
-    }
-
-    // Strip system-reminder tags to get clean user content
-    const cleanContent = textContent
-      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
-      .trim();
-
-    if (cleanContent) {
       let match;
-      while ((match = filePattern.exec(cleanContent)) !== null) {
+      while ((match = filePattern.exec(msg.content)) !== null) {
         const path = match[1];
         // Filter out common false positives
         if (!path.includes('http') && !path.startsWith('.') && path.length > 3) {

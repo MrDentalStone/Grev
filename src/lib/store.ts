@@ -71,6 +71,10 @@ export type SessionMode = 'normal' | 'drifted' | 'forced';
 // Task type for session hierarchy
 export type TaskType = 'main' | 'subtask' | 'parallel';
 
+// User role for Manager/Developer workflow
+// 'blank' = no role injection (general use)
+export type UserRole = 'blank' | 'manager' | 'developer';
+
 // Recovery plan for drift correction (hook uses)
 export interface RecoveryPlan {
   steps: Array<{
@@ -130,6 +134,7 @@ interface ProxyFields {
   completed_at?: string;
   parent_session_id?: string;
   task_type?: TaskType;
+  user_role?: UserRole;
 }
 
 // Full SessionState type (union of all)
@@ -150,6 +155,7 @@ export interface CreateSessionStateInput {
   // Proxy-specific
   parent_session_id?: string;
   task_type?: TaskType;
+  user_role?: UserRole;
 }
 
 // Step action types
@@ -496,6 +502,10 @@ export function initDatabase(): Database.Database {
   if (!existingColumns.has('drift_warnings')) {
     db.exec(`ALTER TABLE session_states ADD COLUMN drift_warnings JSON DEFAULT '[]'`);
   }
+  // Role-based workflow support
+  if (!existingColumns.has('user_role')) {
+    db.exec(`ALTER TABLE session_states ADD COLUMN user_role TEXT DEFAULT 'developer'`);
+  }
 
   // Create steps table (action log for current session)
   db.exec(`
@@ -837,6 +847,7 @@ export function createSessionState(input: CreateSessionStateInput): SessionState
     completed_at: undefined,
     parent_session_id: input.parent_session_id,
     task_type: input.task_type || 'main',
+    user_role: input.user_role || 'developer',
   };
 
   const stmt = database.prepare(`
@@ -846,10 +857,10 @@ export function createSessionState(input: CreateSessionStateInput): SessionState
       token_count, escalation_count, session_mode,
       waiting_for_recovery, last_checked_at, last_clear_at,
       start_time, last_update, status,
-      parent_session_id, task_type,
+      parent_session_id, task_type, user_role,
       success_criteria, last_drift_score, pending_recovery_plan, drift_history,
       completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -871,6 +882,7 @@ export function createSessionState(input: CreateSessionStateInput): SessionState
     sessionState.status,
     sessionState.parent_session_id || null,
     sessionState.task_type,
+    sessionState.user_role || 'developer',
     JSON.stringify(sessionState.success_criteria || []),
     sessionState.last_drift_score || null,
     sessionState.pending_recovery_plan ? JSON.stringify(sessionState.pending_recovery_plan) : null,
@@ -1081,6 +1093,7 @@ function rowToSessionState(row: Record<string, unknown>): SessionState {
     completed_at: row.completed_at as string | undefined,
     parent_session_id: row.parent_session_id as string | undefined,
     task_type: (row.task_type as TaskType) || 'main',
+    user_role: (row.user_role as UserRole) || 'developer',
   };
 }
 

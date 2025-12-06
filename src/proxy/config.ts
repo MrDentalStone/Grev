@@ -1,5 +1,9 @@
 // Proxy configuration
 
+// User role type for Manager/Developer workflow
+// 'blank' = no role injection (general use)
+export type UserRole = 'blank' | 'manager' | 'developer';
+
 export const config = {
   // Server
   HOST: process.env.PROXY_HOST || '127.0.0.1',
@@ -25,6 +29,11 @@ export const config = {
   // Logging
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
   LOG_REQUESTS: process.env.LOG_REQUESTS !== 'false',
+
+  // Role-based workflow (Manager/Developer)
+  // Priority: CLI flag > ENV var > default
+  // 'blank' = no role injection (for general use)
+  USER_ROLE: (process.env.GROV_ROLE as UserRole) || 'blank',
 };
 
 // Headers to forward to Anthropic (whitelist approach)

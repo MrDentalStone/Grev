@@ -2,7 +2,7 @@
 // Intercepts Claude Code <-> Anthropic API traffic for drift detection and context injection
 
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { config, maskSensitiveValue } from './config.js';
+import { config, type UserRole } from './config.js';
 import { forwardToAnthropic, isForwardError } from './forwarder.js';
 import { parseToolUseBlocks, extractTokenUsage, getAllFiles, getAllFolders } from './action-parser.js';
 import type { AnthropicResponse } from './action-parser.js';
@@ -29,6 +29,7 @@ import {
   cleanupOldCompletedSessions,
   type SessionState,
   type TaskType,
+  type UserRole as StoreUserRole,
 } from '../lib/store.js';
 import {
   checkDrift,
@@ -108,11 +109,57 @@ const activeSessions = new Map<string, {
 }>();
 
 /**
+ * Get the current user role from config
+ * Priority: CLI flag (via env) > ENV var > default
+ */
+function getCurrentRole(): UserRole {
+  return config.USER_ROLE || 'blank';
+}
+
+/**
+ * Build role-specific context for injection into system prompt
+ * Returns empty string for 'blank' role (no injection)
+ */
+function buildRoleContext(role: UserRole): string {
+  // 'blank' role = no role injection (general use)
+  if (role === 'blank') {
+    return '';
+  }
+
+  const lines: string[] = [];
+  lines.push(`[GROV ROLE: ${role.toUpperCase()}]`);
+  lines.push('');
+
+  if (role === 'manager') {
+    lines.push('You are in MANAGER mode:');
+    lines.push('- Focus on planning, coordination, and quality review');
+    lines.push('- Create handoff packets for Developer implementation');
+    lines.push('- Do NOT write implementation code directly');
+    lines.push('- Review and approve Developer work before completion');
+    lines.push('- Update STATE.md and DEVELOPMENT_PLAN.md');
+    lines.push('- If you must edit code, this will be logged for audit');
+  } else if (role === 'developer') {
+    lines.push('You are in DEVELOPER mode:');
+    lines.push('- Implement tasks from handoff packets');
+    lines.push('- Follow project coding standards (GCA, COI, etc.)');
+    lines.push('- Run verification protocol before marking complete');
+    lines.push('- If spec is unclear, request Manager clarification');
+    lines.push('- Update STATE.md on task completion');
+  }
+
+  lines.push('');
+  lines.push('[END GROV ROLE]');
+  return lines.join('\n');
+}
+
+/**
  * Create and configure the Fastify server
  */
 export function createServer(): FastifyInstance {
   const fastify = Fastify({
-    logger: false,  // Disabled - all debug goes to ~/.grov/debug.log
+    logger: {
+      level: 'error',  // Only errors in console, details in file
+    },
     bodyLimit: config.BODY_LIMIT,
   });
 
@@ -325,7 +372,8 @@ async function getOrCreateSession(
 
 /**
  * Pre-process request before forwarding
- * - Context injection
+ * - Role context injection
+ * - Team memory context injection
  * - CLEAR operation
  */
 async function preProcessRequest(
@@ -334,20 +382,20 @@ async function preProcessRequest(
   logger: { info: (data: Record<string, unknown>) => void }
 ): Promise<MessagesRequestBody> {
   const modified = { ...body };
-
-  // FIRST: Always inject team memory context (doesn't require sessionState)
-  const mentionedFiles = extractFilesFromMessages(modified.messages || []);
-  const teamContext = buildTeamMemoryContext(sessionInfo.projectPath, mentionedFiles);
-
-  if (teamContext) {
-    appendToSystemPrompt(modified, '\n\n' + teamContext);
-  }
-
-  // THEN: Session-specific operations
   const sessionState = getSessionState(sessionInfo.sessionId);
 
+  // Get current role for context injection
+  const role = getCurrentRole();
+
+  // Inject role context (skip for 'blank' role)
+  const roleContext = buildRoleContext(role);
+  if (roleContext) {
+    appendToSystemPrompt(modified, '\n\n' + roleContext);
+    logger.info({ msg: 'Injected role context', role });
+  }
+
   if (!sessionState) {
-    return modified;  // Injection already happened above!
+    return modified;
   }
 
   // Extract latest user message for drift checking
@@ -434,8 +482,21 @@ Please continue from where you left off.`;
     }
   }
 
-  // Note: Team memory context injection is now at the TOP of preProcessRequest()
-  // so it runs even when sessionState is null (new sessions)
+  // Inject context from team memory (role-aware)
+  const mentionedFiles = extractFilesFromMessages(modified.messages || []);
+  const teamContext = buildTeamMemoryContext(sessionInfo.projectPath, mentionedFiles, role);
+
+  if (teamContext) {
+    appendToSystemPrompt(modified, '\n\n' + teamContext);
+    logger.info({
+      msg: 'Injected team memory context',
+      filesMatched: mentionedFiles.length,
+      role,
+    });
+  }
+
+  // Log final system prompt size
+  const finalSystemSize = getSystemPromptText(modified).length;
 
   return modified;
 }
@@ -454,10 +515,40 @@ async function postProcessResponse(
   response: AnthropicResponse,
   sessionInfo: { sessionId: string; promptCount: number; projectPath: string; currentSession: SessionState | null; completedSession: SessionState | null },
   requestBody: MessagesRequestBody,
-  logger: { info: (data: Record<string, unknown>) => void }
+  logger: { info: (data: Record<string, unknown>) => void; warn: (data: Record<string, unknown>) => void }
 ): Promise<void> {
   // Parse tool_use blocks
   const actions = parseToolUseBlocks(response);
+
+  // Get current role for warning checks
+  const role = getCurrentRole();
+
+  // === MANAGER ROLE WARNING ===
+  // Warn (but don't block) if Manager uses write tools
+  if (role === 'manager' && actions.length > 0) {
+    const writeTools = ['edit', 'write', 'bash'];
+    const writeActions = actions.filter(a => writeTools.includes(a.actionType));
+
+    if (writeActions.length > 0) {
+      logger.warn({
+        msg: 'MANAGER ROLE WARNING: Write tool used',
+        role: 'manager',
+        tools: writeActions.map(a => a.toolName),
+        files: writeActions.flatMap(a => a.files),
+      });
+
+      // Log to drift_log for audit trail
+      for (const action of writeActions) {
+        logDriftEvent({
+          session_id: sessionInfo.sessionId,
+          action_type: action.actionType,
+          files: action.files,
+          drift_score: 5,  // Neutral score - not blocking, just logging
+          drift_reason: `Manager role used ${action.actionType} tool (audit log)`,
+        });
+      }
+    }
+  }
 
   // Extract text content for analysis
   const textContent = extractTextContent(response);
@@ -499,6 +590,7 @@ async function postProcessResponse(
         project_path: sessionInfo.projectPath,
         original_goal: latestUserMessage.substring(0, 500) || 'Task in progress',
         task_type: 'main',
+        user_role: role,
       });
       activeSessionId = newSessionId;
       activeSessions.set(newSessionId, {
@@ -598,6 +690,7 @@ async function postProcessResponse(
             constraints: intentData.constraints,
             keywords: intentData.keywords,
             task_type: 'main',
+            user_role: role,
           });
           activeSessionId = newSessionId;
           activeSessions.set(newSessionId, {
@@ -633,6 +726,7 @@ async function postProcessResponse(
             constraints: intentData.constraints,
             keywords: intentData.keywords,
             task_type: 'subtask',
+            user_role: role,
             parent_session_id: parentId,
           });
           activeSessionId = subtaskId;
@@ -669,6 +763,7 @@ async function postProcessResponse(
             constraints: intentData.constraints,
             keywords: intentData.keywords,
             task_type: 'parallel',
+            user_role: role,
             parent_session_id: parentId,
           });
           activeSessionId = parallelId;
@@ -748,6 +843,7 @@ async function postProcessResponse(
           constraints: intentData.constraints,
           keywords: intentData.keywords,
           task_type: 'main',
+          user_role: role,
         });
         activeSessionId = newSessionId;
       }
@@ -777,6 +873,7 @@ async function postProcessResponse(
         constraints: intentData.constraints,
         keywords: intentData.keywords,
         task_type: 'main',
+        user_role: role,
       });
       activeSessionId = newSessionId;
     } else {
@@ -998,41 +1095,43 @@ function extractProjectPath(body: MessagesRequestBody): string | null {
 }
 
 /**
- * Extract goal from FIRST user message with text content
- * Skips tool_result blocks, filters out system-reminder tags
+ * Extract goal from LATEST user message (not first!)
+ * Filters out system-reminder tags to get the actual user prompt
  */
 function extractGoalFromMessages(messages: Array<{ role: string; content: unknown }>): string | undefined {
+  // Find the LAST user message (most recent prompt)
   const userMessages = messages?.filter(m => m.role === 'user') || [];
+  const lastUser = userMessages[userMessages.length - 1];
 
-  for (const userMsg of userMessages) {
-    let rawContent = '';
+  if (!lastUser) return undefined;
 
-    // Handle string content
-    if (typeof userMsg.content === 'string') {
-      rawContent = userMsg.content;
-    }
+  let rawContent = '';
 
-    // Handle array content - look for text blocks (skip tool_result)
-    if (Array.isArray(userMsg.content)) {
-      const textBlocks = userMsg.content
-        .filter((block): block is { type: string; text: string } =>
-          block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
-        .map(block => block.text);
-      rawContent = textBlocks.join('\n');
-    }
-
-    // Remove <system-reminder>...</system-reminder> tags
-    const cleanContent = rawContent
-      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
-      .trim();
-
-    // If we found valid text content, return it
-    if (cleanContent && cleanContent.length >= 5) {
-      return cleanContent.substring(0, 500);
-    }
+  // Handle string content
+  if (typeof lastUser.content === 'string') {
+    rawContent = lastUser.content;
   }
 
-  return undefined;
+  // Handle array content (new API format)
+  if (Array.isArray(lastUser.content)) {
+    const textBlocks = lastUser.content
+      .filter((block): block is { type: string; text: string } =>
+        block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text);
+    rawContent = textBlocks.join('\n');
+  }
+
+  // Remove <system-reminder>...</system-reminder> tags
+  const cleanContent = rawContent
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .trim();
+
+  // If nothing left after removing reminders, return undefined
+  if (!cleanContent || cleanContent.length < 5) {
+    return undefined;
+  }
+
+  return cleanContent.substring(0, 500);
 }
 
 /**
@@ -1076,6 +1175,45 @@ function isAnthropicResponse(body: unknown): body is AnthropicResponse {
 }
 
 /**
+ * Check if a port is available
+ */
+async function isPortAvailable(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const net = require('net');
+    const server = net.createServer();
+
+    server.once('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        resolve(false);
+      } else {
+        resolve(false);
+      }
+    });
+
+    server.once('listening', () => {
+      server.close();
+      resolve(true);
+    });
+
+    server.listen(port, host);
+  });
+}
+
+/**
+ * Find an available port starting from the given port
+ */
+async function findAvailablePort(host: string, startPort: number, maxAttempts: number = 10): Promise<number> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const port = startPort + i;
+    if (await isPortAvailable(host, port)) {
+      return port;
+    }
+    console.log(`⚠ Port ${port} is in use, trying ${port + 1}...`);
+  }
+  throw new Error(`Could not find available port after ${maxAttempts} attempts starting from ${startPort}`);
+}
+
+/**
  * Start the proxy server
  */
 export async function startServer(): Promise<FastifyInstance> {
@@ -1086,13 +1224,31 @@ export async function startServer(): Promise<FastifyInstance> {
   if (cleanedUp > 0) {
   }
 
+  // Check for port conflicts and find available port
+  let port = config.PORT;
+  const portAvailable = await isPortAvailable(config.HOST, port);
+
+  if (!portAvailable) {
+    console.log(`⚠ Port ${port} is already in use (another Grov instance running?)`);
+    port = await findAvailablePort(config.HOST, port + 1);
+    console.log(`✓ Found available port: ${port}`);
+  }
+
   try {
     await server.listen({
       host: config.HOST,
-      port: config.PORT,
+      port: port,
     });
 
-    console.log(`✓ Grov Proxy: http://${config.HOST}:${config.PORT} → ${config.ANTHROPIC_BASE_URL}`);
+    const role = getCurrentRole();
+    const roleDisplay = role === 'blank' ? '' : ` [${role.toUpperCase()}]`;
+    console.log(`✓ Grov Proxy${roleDisplay}: http://${config.HOST}:${port} → ${config.ANTHROPIC_BASE_URL}`);
+
+    // If we had to use a different port, remind user to update ANTHROPIC_BASE_URL
+    if (port !== config.PORT) {
+      console.log(`\n⚠ NOTE: Using port ${port} instead of ${config.PORT}`);
+      console.log(`  Set ANTHROPIC_BASE_URL=http://${config.HOST}:${port} for Claude to use this proxy`);
+    }
 
     return server;
   } catch (err) {
